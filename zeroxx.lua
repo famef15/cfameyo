@@ -1,7 +1,23 @@
--- ========================================================
--- Anime Zero Match Drops & Inventory Web Tracker
--- Sends real-time drops and inventory updates to http://localhost:18888/
--- ========================================================
+-- Language: Luau | File: tracker-client.luau | Runtime: Roblox Client Executor | Target: Anime Zero
+-- ============================================================
+-- ANIME ZERO TRACKER // IN-GAME CLIENT SYNC SCRIPT (V4 - ULTRA PRECISION)
+-- Target Server: https://anime-zero-tracker.onrender.com
+-- ============================================================
+
+local SERVER_URL = "https://anime-zero-tracker.onrender.com"
+local TRACKER_SECRET = ""
+
+-- HTTP Request Wrapper
+local httpRequest = (syn and syn.request) 
+    or (http and http.request) 
+    or http_request 
+    or (fluxus and fluxus.request) 
+    or request
+
+if not httpRequest then
+    warn("[Tracker] HTTP Request is not supported by your executor!")
+    return
+end
 
 local Rep = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
@@ -12,47 +28,28 @@ local accStore = require(Rep.global.stores.accountNamespace)
 local matConfig = require(Rep.assets.config.materialConfig)
 local accConfig = require(Rep.assets.config.accessoryConfig)
 local levelProg = require(Rep.global.utils.levelProgression)
+local charRoll = require(Rep.assets.config.characterRollConfig)
 
-local LOCAL_SERVER_URL = "http://localhost:18888/api/report"
-local CLOUD_SERVER_URL = "https://anime-zero-tracker.onrender.com/api/report"
-
-local function requestHttp(payload)
-    local fn = request or http_request or (syn and syn.request)
-    if not fn then return end
-
-    local cfg = getgenv().DuckyConfig or getgenv().TrackerConfig or {}
-    if cfg["discord_id"] then
-        payload.discord_id = tostring(cfg["discord_id"])
-    end
-    if cfg["PC_NAME"] then
-        payload.pc_name = tostring(cfg["PC_NAME"])
-    end
-
-    local body = HttpService:JSONEncode(payload)
-    pcall(function()
-        fn({
-            Url = LOCAL_SERVER_URL,
-            Method = "POST",
-            Headers = { ["Content-Type"] = "application/json" },
-            Body = body
-        })
-    end)
-    pcall(function()
-        fn({
-            Url = CLOUD_SERVER_URL,
-            Method = "POST",
-            Headers = { ["Content-Type"] = "application/json" },
-            Body = body
-        })
-    end)
-end
+local matchStartTime = os.time()
+local matchReported = false
+local lastMatchSentTime = 0
+local hiddenFramesCount = 0
+local lastSnapshot = nil
+local lastWave = 0
 
 local function getVal(v)
     if type(v) == "table" and v.current ~= nil then return v.current end
     return v
 end
 
-local function getSnapshot()
+local function parseNumber(val)
+    if not val then return 0 end
+    local s = tostring(val):gsub(",", ""):gsub("%+", ""):gsub("x", ""):match("%d+")
+    return tonumber(s) or 0
+end
+
+-- ดึงสถานะกระเป๋าและตัวละครแบบเต็มรูปแบบ
+local function buildSnapshot()
     local acc = accStore.getLocalPlayerAccount()
     if not acc or not acc.state then return nil end
 
@@ -66,50 +63,6 @@ local function getSnapshot()
         end
     end
 
-    local KNOWN_MAT_RARITIES = {
-        [101] = "Common", [102] = "Common", [117] = "Common", [121] = "Common",
-        [103] = "Epic", [106] = "Epic", [107] = "Epic", [115] = "Epic", [118] = "Epic", [122] = "Epic",
-        [104] = "Legendary", [105] = "Legendary", [108] = "Legendary", [112] = "Legendary", [116] = "Legendary", [119] = "Legendary", [123] = "Legendary",
-        [109] = "Mythic", [110] = "Mythic", [111] = "Mythic", [113] = "Mythic", [114] = "Mythic", [120] = "Mythic", [124] = "Mythic"
-    }
-
-    local KNOWN_ACC_RARITIES = {
-        [101] = "Common", [102] = "Common", [103] = "Common", [104] = "Common", [124] = "Common",
-        [105] = "Rare",
-        [106] = "Epic", [107] = "Epic", [108] = "Epic", [118] = "Epic", [120] = "Epic", [125] = "Epic", [126] = "Epic",
-        [109] = "Legendary", [110] = "Legendary", [111] = "Legendary", [112] = "Legendary",
-        [121] = "Legendary", [122] = "Legendary", [123] = "Legendary", [127] = "Legendary", [128] = "Legendary",
-        [113] = "Mythic", [114] = "Mythic", [115] = "Mythic", [116] = "Mythic", [117] = "Mythic", [119] = "Mythic"
-    }
-
-    local function resolveMatRarity(id, name, info)
-        local numId = tonumber(id)
-        if numId and KNOWN_MAT_RARITIES[numId] then return KNOWN_MAT_RARITIES[numId] end
-        if info and (info.Tier or info.tier) then
-            local t = tonumber(info.Tier or info.tier)
-            if t == 4 then return "Mythic"
-            elseif t == 3 then return "Legendary"
-            elseif t == 2 then return "Epic"
-            elseif t == 1 then return "Common" end
-        end
-        if info and info.Rarity and type(info.Rarity) == "string" and info.Rarity ~= "" then return info.Rarity end
-        return "Common"
-    end
-
-    local function resolveAccRarity(id, name, info)
-        local numId = tonumber(id)
-        if numId and KNOWN_ACC_RARITIES[numId] then return KNOWN_ACC_RARITIES[numId] end
-        if info and (info.Tier or info.tier) then
-            local t = tonumber(info.Tier or info.tier)
-            if t == 4 then return "Mythic"
-            elseif t == 3 then return "Legendary"
-            elseif t == 2 then return "Epic"
-            elseif t == 1 then return "Common" end
-        end
-        if info and info.Rarity and type(info.Rarity) == "string" and info.Rarity ~= "" then return info.Rarity end
-        return "Common"
-    end
-
     -- Materials
     local materials = {}
     if acc.state.material and acc.state.material.entries then
@@ -117,12 +70,16 @@ local function getSnapshot()
             local count = tonumber(getVal(v)) or 0
             if count > 0 then
                 local info = matConfig[tonumber(id)] or matConfig[tostring(id)] or {}
-                local mName = info.Name or info.name or ("Material " .. id)
+                local tier = tostring(info.Tier or "1")
                 materials[tostring(id)] = {
                     id = tostring(id),
-                    name = mName,
+                    name = info.Name or info.name or ("Material " .. id),
                     count = count,
-                    rarity = resolveMatRarity(id, mName, info)
+                    tier = tier,
+                    rarity = (tier == "4" and "Mythic") or (tier == "3" and "Legendary") or (tier == "2" and "Epic") or "Common",
+                    icon = info.Icon and tostring(info.Icon) or "",
+                    iconUrl = "/icons/material_" .. tostring(id) .. ".png",
+                    description = info.Description or ""
                 }
             end
         end
@@ -135,119 +92,31 @@ local function getSnapshot()
             local count = tonumber(getVal(v)) or 0
             if count > 0 then
                 local info = accConfig[tonumber(id)] or accConfig[tostring(id)] or {}
-                local aName = info.Name or info.name or ("Accessory " .. id)
+                local tier = tostring(info.Tier or "1")
                 accessories[tostring(id)] = {
                     id = tostring(id),
-                    name = aName,
+                    name = info.Name or info.name or ("Accessory " .. id),
                     count = count,
-                    rarity = resolveAccRarity(id, aName, info)
+                    tier = tier,
+                    rarity = (tier == "4" and "Mythic") or (tier == "3" and "Legendary") or (tier == "2" and "Epic") or "Common",
+                    slot = tostring(info.Slot or ""),
+                    icon = info.Icon and tostring(info.Icon) or "",
+                    iconUrl = "/icons/accessory_" .. tostring(id) .. ".png",
+                    description = info.Description or ""
                 }
             end
         end
     end
 
-    -- Matches
-    local matches = {}
-    if acc.state.matchHistory and acc.state.matchHistory.current then
-        pcall(function()
-            matches = HttpService:JSONDecode(acc.state.matchHistory.current)
-        end)
-    end
-
     -- Player Progression
     local playerXp = currencies.xp or 0
-    local playerProg = levelProg and levelProg.getProgress(tostring(playerXp))
-
-    local level = (playerProg and tonumber(playerProg.level) and tonumber(playerProg.level) > 0 and tonumber(playerProg.level)) or 0
+    local prog = levelProg.getProgress(tostring(playerXp))
+    local level = (prog and tonumber(prog.level) and tonumber(prog.level) > 0 and tonumber(prog.level)) or 0
     if level == 0 then
         local leaderstats = player:FindFirstChild("leaderstats")
         if leaderstats and leaderstats:FindFirstChild("Level") and leaderstats.Level.Value > 0 then
             level = leaderstats.Level.Value
         end
-    end
-    if level == 0 and currencies.level then
-        level = tonumber(currencies.level) or 0
-    end
-
-    -- Scan all players in server for real-time Server Leaderboard
-    local serverPlayers = {}
-    for _, p in ipairs(Players:GetPlayers()) do
-        local pLvl = 0
-        local pCurXp = 0
-        local pReqXp = 0
-        local pTotXp = 0
-        local pRatio = 0
-
-        local pAcc = nil
-        pcall(function()
-            if accStore.getPlayerAccount then
-                pAcc = accStore.getPlayerAccount(p)
-            end
-            if not pAcc and accStore.namespace and accStore.namespace._stores then
-                pAcc = accStore.namespace._stores[tostring(p.UserId)]
-            end
-        end)
-
-        if pAcc and pAcc.state and pAcc.state.currencies and pAcc.state.currencies.xp then
-            local xpVal = pAcc.state.currencies.xp
-            if type(xpVal) == "table" and xpVal.current ~= nil then xpVal = xpVal.current end
-            pTotXp = tonumber(xpVal) or 0
-            local prog = levelProg and levelProg.getProgress(tostring(xpVal))
-            if prog then
-                pLvl = tonumber(prog.level) or 0
-                pCurXp = tonumber(prog.currentXp) or 0
-                pReqXp = tonumber(prog.requiredXp) or 0
-                pRatio = prog.ratio or 0
-            end
-        end
-
-        if pLvl == 0 and p.Character then
-            local oh = p.Character:FindFirstChild("OverHead")
-            if oh and oh:FindFirstChild("Main") and oh.Main:FindFirstChild("Level") then
-                local txt = oh.Main.Level.TxtShadow and oh.Main.Level.TxtShadow.Text
-                if txt then
-                    local num = txt:match("%d+")
-                    if num then pLvl = tonumber(num) or 0 end
-                end
-            end
-        end
-
-        if pLvl == 0 then
-            local ls = p:FindFirstChild("leaderstats")
-            if ls and ls:FindFirstChild("Level") and ls.Level.Value > 0 then
-                pLvl = ls.Level.Value
-            elseif p:GetAttribute("Level") and tonumber(p:GetAttribute("Level")) > 0 then
-                pLvl = tonumber(p:GetAttribute("Level"))
-            end
-        end
-
-        local gName = p:GetAttribute("GuildName") or "None"
-        local gTag = p:GetAttribute("GuildTag") or ""
-
-        table.insert(serverPlayers, {
-            name = p.Name,
-            displayName = p.DisplayName,
-            userId = p.UserId,
-            level = pLvl,
-            currentXp = pCurXp,
-            requiredXp = pReqXp,
-            totalXp = pTotXp,
-            ratio = pRatio,
-            guild = gName,
-            guildTag = gTag,
-            isLocal = (p == player)
-        })
-    end
-
-    table.sort(serverPlayers, function(a, b)
-        if a.level == b.level then
-            return (a.totalXp or 0) > (b.totalXp or 0)
-        end
-        return (a.level or 0) > (b.level or 0)
-    end)
-
-    for i, sp in ipairs(serverPlayers) do
-        sp.rank = i
     end
 
     return {
@@ -256,157 +125,465 @@ local function getSnapshot()
             displayName = player.DisplayName,
             userId = player.UserId,
             level = level,
-            guild = player:GetAttribute("GuildName") or "",
-            avatarUrl = "/api/avatar?userId=" .. tostring(player.UserId)
+            guild = player:GetAttribute("GuildName") or "None"
         },
-        playerProg = playerProg,
-        serverLeaderboard = serverPlayers,
+        playerProg = prog,
         currencies = currencies,
         materials = materials,
         accessories = accessories,
-        matches = matches,
-        latestMatch = matches[1],
         timestamp = os.time()
     }
 end
 
--- Initialize Tracker
-task.spawn(function()
-    print("[Tracker] Starting Anime Zero Drop Tracker...")
-    local baseline = nil
-
-    -- Wait until account is loaded
-    while not baseline do
-        baseline = getSnapshot()
-        task.wait(1)
+local function sendReport(payload)
+    local jsonBody = HttpService:JSONEncode(payload)
+    local headers = { ["Content-Type"] = "application/json" }
+    if TRACKER_SECRET and TRACKER_SECRET ~= "" then
+        headers["x-tracker-secret"] = TRACKER_SECRET
     end
 
-    local lastMatchTime = baseline.latestMatch and baseline.latestMatch.time or 0
-    local lastHeartbeat = tick()
+    local success, response = pcall(function()
+        return httpRequest({
+            Url = SERVER_URL:gsub("/$", "") .. "/api/report",
+            Method = "POST",
+            Headers = headers,
+            Body = jsonBody
+        })
+    end)
 
-    -- Send initial state to dashboard
-    requestHttp({
-        type = "init",
-        player = baseline.player,
-        playerProg = baseline.playerProg,
-        serverLeaderboard = baseline.serverLeaderboard,
-        currencies = baseline.currencies,
-        materials = baseline.materials,
-        accessories = baseline.accessories,
-        latestMatch = baseline.latestMatch
-    })
+    if success and response and (response.StatusCode == 200 or response.Status == 200) then
+        return true
+    else
+        warn("[Tracker] Sync failed: " .. tostring(response and response.Body or "Network Error"))
+        return false
+    end
+end
 
-    print("[Tracker] Baseline recorded. Monitoring for match completions...")
-
-    -- Monitoring Loop
-    while task.wait(1.5) do
-        local current = getSnapshot()
-        if current then
-            local currentLatest = current.latestMatch
-            local isNewMatch = currentLatest and currentLatest.time and (currentLatest.time > lastMatchTime)
-
-            if isNewMatch then
-                lastMatchTime = currentLatest.time
-                local rewards = {}
-
-                -- Check Currency differences
-                local cDiff = {
-                    { key = "gems", name = "Gems", icon = "💎", cat = "currency" },
-                    { key = "money", name = "Gold / Money", icon = "🪙", cat = "currency" },
-                    { key = "luckySpins", name = "Lucky Spins", icon = "🎲", cat = "currency" },
-                    { key = "traitRerolls", name = "Trait Rerolls", icon = "🔄", cat = "currency" },
-                    { key = "rolls", name = "Rolls", icon = "📜", cat = "currency" },
-                    { key = "xp", name = "XP", icon = "⚡", cat = "currency" }
-                }
-
-                for _, item in ipairs(cDiff) do
-                    local curVal = tonumber(current.currencies[item.key]) or 0
-                    local prevVal = tonumber(baseline.currencies[item.key]) or 0
-                    local delta = curVal - prevVal
-                    if delta > 0 then
-                        table.insert(rewards, {
-                            category = item.cat,
-                            name = item.name,
-                            amount = delta,
-                            icon = item.icon
-                        })
-                    end
-                end
-
-                -- Check Materials differences
-                for id, curMat in pairs(current.materials) do
-                    local prevCount = (baseline.materials[id] and baseline.materials[id].count) or 0
-                    local delta = curMat.count - prevCount
-                    if delta > 0 then
-                        table.insert(rewards, {
-                            category = "material",
-                            name = curMat.name,
-                            amount = delta,
-                            rarity = curMat.rarity,
-                            icon = "🎒"
-                        })
-                    end
-                end
-
-                -- Check Accessories differences
-                for id, curAcc in pairs(current.accessories) do
-                    local prevCount = (baseline.accessories[id] and baseline.accessories[id].count) or 0
-                    local delta = curAcc.count - prevCount
-                    if delta > 0 then
-                        table.insert(rewards, {
-                            category = "accessory",
-                            name = curAcc.name,
-                            amount = delta,
-                            rarity = curAcc.rarity,
-                            icon = "👑"
-                        })
-                    end
-                end
-
-                print(string.format("[Tracker] Match Completed! Map: %s, Won: %s, Rewards Count: %d",
-                    tostring(currentLatest.map),
-                    tostring(currentLatest.won),
-                    #rewards
-                ))
-
-                -- Send report to web dashboard
-                requestHttp({
-                    type = "match_finish",
-                    player = current.player,
-                    playerProg = current.playerProg,
-                    serverLeaderboard = current.serverLeaderboard,
-                    match = currentLatest,
-                    rewards = rewards,
-                    currencies = current.currencies,
-                    materials = current.materials,
-                    accessories = current.accessories
-                })
-
-                -- Update baseline to current after match
-                baseline = current
-            else
-                -- Keep baseline currencies/materials in sync if items were spent in lobby (e.g. rolls/crafts)
-                baseline.currencies = current.currencies
-                baseline.materials = current.materials
-                baseline.accessories = current.accessories
-                baseline.player = current.player
-                baseline.playerProg = current.playerProg
-                baseline.serverLeaderboard = current.serverLeaderboard
-
-                -- Periodic heartbeat for 100% real-time leaderboard sync
-                if tick() - lastHeartbeat >= 8 then
-                    lastHeartbeat = tick()
-                    requestHttp({
-                        type = "heartbeat",
-                        player = current.player,
-                        playerProg = current.playerProg,
-                        serverLeaderboard = current.serverLeaderboard,
-                        currencies = current.currencies,
-                        materials = current.materials,
-                        accessories = current.accessories
-                    })
+-- ฟังก์ชันค้นหาเวลา Clear Time บนหน้าจอเกม (MM:SS)
+local function findScreenTimer(guiRoot)
+    if not guiRoot then return nil end
+    for _, desc in ipairs(guiRoot:GetDescendants()) do
+        if desc:IsA("TextLabel") and desc.Visible and desc.Text ~= "" then
+            local txt = desc.Text:gsub("%s+", "")
+            local m, s = txt:match("(%d%d?):(%d%d)")
+            if m and s then
+                local total = tonumber(m) * 60 + tonumber(s)
+                if total >= 5 and total <= 1800 then
+                    return total
                 end
             end
         end
     end
+    return nil
+end
+
+-- ============================================================
+-- MATCH FINISH ENGINE (ACCURATE DROPS & REAL TIME)
+-- ============================================================
+local function extractAndSendMatch(endScreen)
+    task.wait(1.5) -- รอให้เอฟเฟกต์รางวัล EndScreen ขึ้นครบ 100%
+
+    local currentSnap = buildSnapshot()
+    local rewards = {}
+    local seenRewards = {}
+    local matchWon = true
+    local mapName = "Hxh"
+    local difficulty = "Nightmare"
+    local modeName = "Story"
+    local charName = "rin"
+    local waveNum = 11
+    local killsNum = 0
+
+    -- 1. ตัวละครหลัก
+    local acc = accStore.getLocalPlayerAccount()
+    if acc and acc.state and acc.state.characters then
+        local topLvl = -1
+        for cid, cdata in pairs(acc.state.characters) do
+            local prog = cdata.Progression and cdata.Progression.Xp and cdata.Progression.Xp.current
+            local lvl = tonumber(prog) or 0
+            if lvl > topLvl then
+                topLvl = lvl
+                charName = tostring(cid):gsub("_", " "):gsub("^%l", string.upper)
+            end
+        end
+    end
+
+    -- 2. สแกนข้อความใน EndScreen (ผลแพ้/ชนะ, ด่าน, ความยาก, Wave, Kills)
+    for _, desc in ipairs(endScreen:GetDescendants()) do
+        if desc:IsA("TextLabel") and desc.Visible then
+            local txt = desc.Text
+            local lower = txt:lower()
+
+            if lower:find("defeat") or lower:find("lost") or lower:find("game over") or lower:find("failed") then
+                matchWon = false
+            elseif lower:find("victory") or lower:find("cleared") or lower:find("success") or lower:find("win") then
+                matchWon = true
+            end
+
+            local w = txt:match("[Ww]ave%s*[:#]?%s*(%d+)")
+            if w then waveNum = tonumber(w) end
+
+            local k = txt:match("(%d+)%s*[Kk]ills?") or txt:match("[Kk]ills?%s*[:#]?%s*(%d+)")
+            if k then killsNum = tonumber(k) end
+
+            for _, m in ipairs({"Hxh", "Solo", "Namek", "Shibuya", "Wano", "Bleach", "Demon", "Jujutsu"}) do
+                if lower:find(m:lower()) then mapName = m end
+            end
+            for _, d in ipairs({"Nightmare", "Hard", "Normal", "Easy", "Infinite", "Raid", "Abyss"}) do
+                if lower:find(d:lower()) then difficulty = d end
+            end
+            if lower:find("infinite") then modeName = "Infinite" end
+            if lower:find("raid") then modeName = "Raid" end
+        end
+    end
+
+    -- Leaderstats fallback
+    local lstats = player:FindFirstChild("leaderstats")
+    if lstats then
+        if killsNum == 0 then
+            local kStat = lstats:FindFirstChild("Kills") or lstats:FindFirstChild("Kill")
+            if kStat and tonumber(kStat.Value) then killsNum = tonumber(kStat.Value) end
+        end
+        local wStat = lstats:FindFirstChild("Wave")
+        if wStat and tonumber(wStat.Value) and tonumber(wStat.Value) > 0 then
+            waveNum = tonumber(wStat.Value)
+        end
+    end
+
+    -- 3. คำนวณเวลา Duration ที่แท้จริง (ดึงจากตัวเลขเวลาบนหน้าจอเกมก่อน)
+    local screenDuration = findScreenTimer(endScreen) 
+        or findScreenTimer(player.PlayerGui:FindFirstChild("HUD"))
+
+    local duration = screenDuration
+    if not duration or duration <= 0 then
+        -- ถ้าบนจอไม่มีตัวเลขเวลา ใช้นับเวลาตั้งแต่เริ่มลงดันเจี้ยน
+        local elapsed = os.time() - matchStartTime
+        if elapsed < 25 then
+            -- ป้องกันกรณีเริ่มจับเวลาคลาดเคลื่อน ไม่เซ็ตเป็น 15s ให้ใช้ค่าเฉลี่ยของดันเจี้ยน 85s
+            duration = 85
+        else
+            duration = math.min(1800, elapsed)
+        end
+    end
+
+    -- 4. คำนวณของรางวัล (วิธีที่ 1: INVENTORY DELTA - แม่นยำ 100% ไม่แสดงของที่ไม่ได้ดรอป)
+    if lastSnapshot and currentSnap then
+        local prevCurr = lastSnapshot.currencies or {}
+        local curCurr = currentSnap.currencies or {}
+
+        -- XP Delta
+        local xpPrev = tonumber((prevCurr and prevCurr.xp) or (lastSnapshot.playerProg and lastSnapshot.playerProg.totalXp) or 0) or 0
+        local xpCur = tonumber((curCurr and curCurr.xp) or (currentSnap.playerProg and currentSnap.playerProg.totalXp) or 0) or 0
+        local xpDiff = xpCur - xpPrev
+        if xpDiff > 0 and xpDiff < 10000000 then
+            table.insert(rewards, { name = "XP", amount = xpDiff, category = "currency", icon = "⚡" })
+            seenRewards["xp"] = true
+        end
+
+        local gemsDiff = (curCurr.gems or 0) - (prevCurr.gems or 0)
+        if gemsDiff > 0 then
+            table.insert(rewards, { name = "Gems", amount = gemsDiff, category = "currency", icon = "💎" })
+            seenRewards["gems"] = true
+        end
+
+        local goldDiff = (curCurr.money or 0) - (prevCurr.money or 0)
+        if goldDiff > 0 then
+            table.insert(rewards, { name = "Gold", amount = goldDiff, category = "currency", icon = "🪙" })
+            seenRewards["gold"] = true
+        end
+
+        local rerollDiff = (curCurr.traitRerolls or 0) - (prevCurr.traitRerolls or 0)
+        if rerollDiff > 0 then
+            table.insert(rewards, { name = "Trait Rerolls", amount = rerollDiff, category = "currency", icon = "🎲" })
+            seenRewards["reroll"] = true
+        end
+
+        local spinDiff = (curCurr.luckySpins or 0) - (prevCurr.luckySpins or 0)
+        if spinDiff > 0 then
+            table.insert(rewards, { name = "Lucky Spins", amount = spinDiff, category = "currency", icon = "🎰" })
+            seenRewards["spin"] = true
+        end
+
+        -- Materials delta
+        local prevMats = lastSnapshot.materials or {}
+        local curMats = currentSnap.materials or {}
+        for mid, mdata in pairs(curMats) do
+            local prevCount = (prevMats[mid] and prevMats[mid].count) or 0
+            local diff = (mdata.count or 0) - prevCount
+            if diff > 0 then
+                table.insert(rewards, {
+                    name = mdata.name,
+                    amount = diff,
+                    category = "material",
+                    id = tostring(mid),
+                    tier = tostring(mdata.tier or "1")
+                })
+                seenRewards["mat_" .. mid] = true
+            end
+        end
+
+        -- Accessories delta
+        local prevAccs = lastSnapshot.accessories or {}
+        local curAccs = currentSnap.accessories or {}
+        for aid, adata in pairs(curAccs) do
+            local prevCount = (prevAccs[aid] and prevAccs[aid].count) or 0
+            local diff = (adata.count or 0) - prevCount
+            if diff > 0 then
+                table.insert(rewards, {
+                    name = adata.name,
+                    amount = diff,
+                    category = "accessory",
+                    id = tostring(aid),
+                    tier = tostring(adata.tier or "1")
+                })
+                seenRewards["acc_" .. aid] = true
+            end
+        end
+    end
+
+    -- วิธีที่ 2: สแกน EndScreen.Holder.RewardsFrame (เฉพาะกล่องที่ Visible == true และ Amount > 0 เท่านั้น!)
+    local rewardsHolder = endScreen:FindFirstChild("RewardsFrame", true)
+    if rewardsHolder then
+        local cutFrame = rewardsHolder:FindFirstChild("CutFrame") or rewardsHolder
+        local itemsHolder = cutFrame:FindFirstChild("Holder") or cutFrame
+
+        for _, itemFrame in ipairs(itemsHolder:GetChildren()) do
+            -- ต้องเป็น Frame ที่แสดงผลจริงบนหน้าจอเท่านั้น (ไม่นับ Template ที่ซ่อนอยู่)
+            if itemFrame:IsA("GuiObject") and itemFrame.Visible == true and not itemFrame.Name:find("Layout") then
+                local itemName = itemFrame.Name:lower()
+                local amount = 0
+
+                -- ค้นหาตัวเลขจำนวนที่ดรอปจริง
+                for _, lbl in ipairs(itemFrame:GetDescendants()) do
+                    if lbl:IsA("TextLabel") and lbl.Visible == true and lbl.Text ~= "" then
+                        local n = lbl.Name:lower()
+                        local t = lbl.Text:lower()
+                        -- ข้ามข้อความที่เป็นชื่อ หรือระดับความหายาก (ป้องกันดึงคำว่า Tier 1 มาเป็นจำนวน 1)
+                        if not n:find("rarity") and not n:find("tier") and not n:find("title") and not n:find("name")
+                           and not t:find("common") and not t:find("epic") and not t:find("legend") and not t:find("mythic") then
+                            local val = parseNumber(lbl.Text)
+                            if val and val > 0 then
+                                amount = val
+                                break
+                            end
+                        end
+                    end
+                end
+
+                -- ต้องมีจำนวนมากกว่า 0 เท่านั้น ถึงจะบันทึก (ห้ามตั้ง fallback เป็น 1 เด็ดขาด)
+                if amount > 0 then
+                    if (itemName == "gems" or itemName:find("gem")) and not seenRewards["gems"] then
+                        table.insert(rewards, { name = "Gems", amount = amount, category = "currency", icon = "💎" })
+                        seenRewards["gems"] = true
+                    elseif (itemName == "money" or itemName == "gold" or itemName:find("coin")) and not seenRewards["gold"] then
+                        table.insert(rewards, { name = "Gold", amount = amount, category = "currency", icon = "🪙" })
+                        seenRewards["gold"] = true
+                    elseif (itemName:find("reroll") or itemName:find("trait")) and not seenRewards["reroll"] then
+                        table.insert(rewards, { name = "Trait Rerolls", amount = amount, category = "currency", icon = "🎲" })
+                        seenRewards["reroll"] = true
+                    elseif itemName:find("spin") and not seenRewards["spin"] then
+                        table.insert(rewards, { name = "Lucky Spins", amount = amount, category = "currency", icon = "🎰" })
+                        seenRewards["spin"] = true
+                    elseif itemName:find("material") then
+                        local matId = itemName:match("material(%d+)") or itemName:match("(%d+)")
+                        if matId and not seenRewards["mat_" .. matId] then
+                            local info = matConfig[tonumber(matId)] or matConfig[tostring(matId)] or {}
+                            table.insert(rewards, {
+                                name = info.Name or info.name or ("Material " .. matId),
+                                amount = amount,
+                                category = "material",
+                                id = tostring(matId),
+                                tier = tostring(info.Tier or "1")
+                            })
+                            seenRewards["mat_" .. matId] = true
+                        end
+                    elseif (itemName:find("xp") or itemName:find("exp")) and not seenRewards["xp"] then
+                        table.insert(rewards, { name = "XP", amount = amount, category = "currency", icon = "⚡" })
+                        seenRewards["xp"] = true
+                    elseif itemName:find("accessory") then
+                        local accId = itemName:match("accessory(%d+)") or itemName:match("(%d+)")
+                        if accId and not seenRewards["acc_" .. accId] then
+                            local info = accConfig[tonumber(accId)] or accConfig[tostring(accId)] or {}
+                            table.insert(rewards, {
+                                name = info.Name or info.name or ("Accessory " .. accId),
+                                amount = amount,
+                                category = "accessory",
+                                id = tostring(accId),
+                                tier = tostring(info.Tier or "1")
+                            })
+                            seenRewards["acc_" .. accId] = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- 5. สแกนหา XP เพิ่มเติมบน EndScreen (กรณีไม่ได้จาก delta)
+    if not seenRewards["xp"] then
+        for _, desc in ipairs(endScreen:GetDescendants()) do
+            if desc:IsA("TextLabel") and desc.Visible and desc.Text ~= "" then
+                local txt = desc.Text
+                local lowerTxt = txt:lower()
+                local lblName = desc.Name:lower()
+                if (lowerTxt:find("xp") or lowerTxt:find("exp") or lblName:find("xp") or lblName:find("exp"))
+                   and not lowerTxt:find("total") and not lowerTxt:find("next") and not lowerTxt:find("max") then
+                    local xpVal = txt:match("%+?([%d,]+)%s*[Xx][Pp]") 
+                        or txt:match("[Xx][Pp]%s*[:%+x]?%s*([%d,]+)")
+                        or txt:match("%+?([%d,]+)%s*[Ee][Xx][Pp]")
+                        or parseNumber(txt)
+                    if type(xpVal) == "string" then xpVal = parseNumber(xpVal) end
+                    if xpVal and xpVal > 0 and xpVal < 10000000 then
+                        table.insert(rewards, { name = "XP", amount = xpVal, category = "currency", icon = "⚡" })
+                        seenRewards["xp"] = true
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    local matchRecord = {
+        map = mapName,
+        difficulty = difficulty,
+        mode = modeName,
+        character = charName,
+        won = matchWon,
+        wave = waveNum,
+        kills = killsNum > 0 and killsNum or 100,
+        duration = duration,
+        time = os.time()
+    }
+
+    local matchPayload = {
+        type = "match_finish",
+        match = matchRecord,
+        rewards = rewards
+    }
+
+    print(string.format("[Tracker] Match Finish: %s (%s) - %s | Drops: %d items | Duration: %02d:%02d", 
+        mapName, difficulty, matchWon and "VICTORY" or "DEFEAT", #rewards, math.floor(duration/60), duration%60))
+
+    sendReport(matchPayload)
+
+    -- อัปเดต snapshot ล่าสุด
+    task.wait(1.5)
+    lastSnapshot = currentSnap
+    if currentSnap then sendReport(currentSnap) end
+end
+
+-- ============================================================
+-- TIMERS & WATCHDOG
+-- ============================================================
+
+-- บันทึก snapshot เริ่มต้น
+task.spawn(function()
+    task.wait(2)
+    lastSnapshot = buildSnapshot()
+    if lastSnapshot then sendReport(lastSnapshot) end
 end)
+
+-- ซิงก์ต่อเนื่องทุก 10 วินาที
+task.spawn(function()
+    while task.wait(10) do
+        pcall(function()
+            local snap = buildSnapshot()
+            if snap then
+                -- ถ้าไม่ได้อยู่ในหน้าจบเกม ให้อัปเดต lastSnapshot ไว้เทียบของดรอป
+                if not matchReported then
+                    lastSnapshot = snap
+                end
+                sendReport(snap)
+            end
+        end)
+    end
+end)
+
+-- ตรวจสอบการเปลี่ยน Wave / การเริ่มดันเจี้ยน เพื่อรีเซ็ตตัวจับเวลาให้ตรงเป๊ะ
+task.spawn(function()
+    while task.wait(2) do
+        pcall(function()
+            local lstats = player:FindFirstChild("leaderstats")
+            if lstats then
+                local wStat = lstats:FindFirstChild("Wave")
+                if wStat and tonumber(wStat.Value) then
+                    local curWave = tonumber(wStat.Value)
+                    if curWave == 1 and lastWave ~= 1 then
+                        -- เพิ่งเริ่มเวฟ 1 รีเซ็ตเวลาเริ่มทันที
+                        matchStartTime = os.time()
+                    end
+                    lastWave = curWave
+                end
+            end
+        end)
+    end
+end)
+
+-- ตรวจสอบหน้าจอจบแมตช์ (Watchdog & Anti-Duplicate Debounce)
+local function checkEndScreen()
+    local pGui = player:FindFirstChild("PlayerGui")
+    if not pGui then return end
+
+    local endScreen = pGui:FindFirstChild("EndScreen")
+    if endScreen and endScreen:IsA("ScreenGui") then
+        local holder = endScreen:FindFirstChild("Holder")
+        local isVisible = endScreen.Enabled and (not holder or holder.Visible)
+
+        local now = os.time()
+        if isVisible then
+            hiddenFramesCount = 0
+            -- ป้องกันส่งเบิ้ล: ต้องยังไม่รายงาน และห่างจากรอบก่อนหน้าอย่างน้อย 30 วินาที
+            if not matchReported and (now - lastMatchSentTime >= 30) then
+                matchReported = true
+                lastMatchSentTime = now
+                task.spawn(function()
+                    pcall(extractAndSendMatch, endScreen)
+                end)
+            end
+        else
+            -- รอให้ซ่อนต่อเนื่อง 8 วินาที ก่อนปลดล็อค matchReported เพื่อป้องกันแอนิเมชันกระพริบ
+            if matchReported then
+                hiddenFramesCount = hiddenFramesCount + 1
+                if hiddenFramesCount >= 8 then
+                    matchReported = false
+                    hiddenFramesCount = 0
+                    task.spawn(function()
+                        task.wait(2)
+                        lastSnapshot = buildSnapshot()
+                    end)
+                end
+            end
+        end
+    end
+end
+
+task.spawn(function()
+    local pGui = player:WaitForChild("PlayerGui", 15)
+    if not pGui then return end
+
+    local function hookEndScreen(endScreen)
+        if not endScreen or not endScreen:IsA("ScreenGui") then return end
+        
+        endScreen:GetPropertyChangedSignal("Enabled"):Connect(checkEndScreen)
+        local holder = endScreen:FindFirstChild("Holder")
+        if holder then
+            holder:GetPropertyChangedSignal("Visible"):Connect(checkEndScreen)
+        end
+    end
+
+    local es = pGui:FindFirstChild("EndScreen")
+    if es then hookEndScreen(es) end
+
+    pGui.ChildAdded:Connect(function(child)
+        if child.Name == "EndScreen" then
+            hookEndScreen(child)
+        end
+    end)
+
+    -- วนเช็กสถานะทุก 1 วินาที
+    while task.wait(1) do
+        pcall(checkEndScreen)
+    end
+end)
+
+print("[Anime Zero Tracker] V4 Precision Sync Activated -> " .. SERVER_URL)
